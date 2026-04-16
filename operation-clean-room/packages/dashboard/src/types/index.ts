@@ -185,6 +185,9 @@ export interface Discrepancy {
   };
   customerName: string;
   amount: number | null;
+  percentDelta?: number | null;
+  direction?: string | null;
+  scope?: 'billing_vs_crm' | 'billing_vs_billing' | 'duplicate_review' | 'pipeline_review';
   description: string;
   detectedAt: string;
   resolved: boolean;
@@ -236,6 +239,9 @@ export interface PipelineQuality {
     issue: string;
     crmValue: string | number;
     billingValue: string | number;
+    billingSystems: string[];
+    percentDelta: number;
+    direction: 'over-reporting' | 'under-reporting';
   }[];
   unbookedRevenue: {
     subscriptionId: string;

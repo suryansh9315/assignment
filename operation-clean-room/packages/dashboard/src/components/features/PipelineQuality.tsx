@@ -24,7 +24,20 @@ type MismatchRow = Record<string, unknown> & {
   issue: string;
   crmValue: string | number;
   billingValue: string | number;
+  billingSystems: string[];
+  percentDelta: number;
+  direction: 'over-reporting' | 'under-reporting';
 };
+
+function formatCurrencyValue(value: string | number | null | undefined): string {
+  const numericValue = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(numericValue) ? currencyFormatter.format(numericValue) : 'n/a';
+}
+
+function formatBillingSystems(value: string[] | null | undefined): string {
+  if (!Array.isArray(value) || value.length === 0) return 'n/a';
+  return Array.from(new Set(value)).join(', ');
+}
 
 export function PipelineQuality() {
   const { data, isLoading, error } = useApi(['reconciliation', 'pipeline'], getPipelineQuality);
@@ -39,8 +52,9 @@ export function PipelineQuality() {
         <p className="metric-label mb-2">CRM Audit</p>
         <h1 className="text-2xl font-semibold text-slate-100">Pipeline Quality</h1>
         <p className="mt-2 max-w-3xl text-sm text-slate-400">
-          Closed-won opportunities are checked against billing, and stale open deals are separated
-          from board-ready pipeline.
+          Closed-won opportunities are checked against the active total across Stripe, Chargebee,
+          and Meridian legacy billing, with mismatches flagged once billing drifts more than 2%
+          from CRM.
         </p>
       </div>
 
@@ -58,17 +72,17 @@ export function PipelineQuality() {
             />
             <Card
               title="Zombie Deals"
-              value={data?.summary.totalZombieDeals ?? 0}
+              value={isLoading ? 'Loading' : data?.summary.totalZombieDeals ?? 0}
               icon={<AlertTriangle size={18} />}
             />
             <Card
               title="Zombie Value"
-              value={currencyFormatter.format(data?.summary.totalZombieValue ?? 0)}
+              value={isLoading ? 'Loading' : currencyFormatter.format(data?.summary.totalZombieValue ?? 0)}
               icon={<BadgeDollarSign size={18} />}
             />
             <Card
               title="Unbooked MRR"
-              value={currencyFormatter.format(data?.summary.totalUnbookedMRR ?? 0)}
+              value={isLoading ? 'Loading' : currencyFormatter.format(data?.summary.totalUnbookedMRR ?? 0)}
               icon={<Activity size={18} />}
             />
           </div>
@@ -103,8 +117,32 @@ export function PipelineQuality() {
               columns={[
                 { key: 'accountName', label: 'Account', sortable: true },
                 { key: 'issue', label: 'Finding' },
-                { key: 'crmValue', label: 'CRM value', className: 'text-right font-mono' },
-                { key: 'billingValue', label: 'Billing value', className: 'text-right font-mono' },
+                {
+                  key: 'billingSystems',
+                  label: 'Billing systems',
+                  width: '10rem',
+                  className: 'max-w-[10rem] whitespace-normal break-words text-xs text-slate-400',
+                  render: (value) => formatBillingSystems(Array.isArray(value) ? value as string[] : undefined),
+                },
+                {
+                  key: 'crmValue',
+                  label: 'CRM value',
+                  className: 'text-right font-mono',
+                  render: (value) => formatCurrencyValue(value as string | number | null | undefined),
+                },
+                {
+                  key: 'billingValue',
+                  label: 'Billing value',
+                  className: 'text-right font-mono',
+                  render: (value) => formatCurrencyValue(value as string | number | null | undefined),
+                },
+                {
+                  key: 'percentDelta',
+                  label: 'Delta %',
+                  className: 'text-right font-mono',
+                  render: (value) => `${Number(value ?? 0).toFixed(2)}%`,
+                },
+                { key: 'direction', label: 'Direction', sortable: true },
               ]}
             />
           </section>

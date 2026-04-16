@@ -116,11 +116,22 @@ function getMedianGapDays(dates: string[]): number {
 function parsePlanName(value: string | null | undefined): string {
   const normalized = (value ?? '').toLowerCase();
   if (normalized.includes('enterprise')) return 'Enterprise';
-  if (normalized.includes('growth') || normalized.includes('scale') || normalized.includes('platform')) {
-    return 'Growth';
-  }
+  if (normalized.includes('scale')) return 'Scale';
+  if (normalized.includes('growth') || normalized.includes('platform')) return 'Growth';
   if (normalized.includes('starter') || normalized.includes('basic')) return 'Starter';
   if (normalized.includes('meridian')) return 'Meridian Legacy';
+  return 'Unknown';
+}
+
+function inferStripePlanName(payments: StripePayment[]): string {
+  for (let i = payments.length - 1; i >= 0; i--) {
+    const payment = payments[i]!;
+    const planName = parsePlanName(payment.description);
+    if (planName !== 'Unknown') {
+      return planName;
+    }
+  }
+
   return 'Unknown';
 }
 
@@ -215,7 +226,7 @@ function aggregateStripeSubscriptions(payments: StripePayment[]): StripeSubscrip
         positiveAmounts.length === 0
           ? 0
           : Math.round((positiveAmounts.reduce((sum, amount) => sum + amount, 0) / positiveAmounts.length) * 12),
-      planName: parsePlanName(latest.description),
+      planName: inferStripePlanName(sortedPayments),
     };
   });
 }

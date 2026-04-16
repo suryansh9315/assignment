@@ -1,5 +1,6 @@
 import type { CohortData, MetricOptions } from './types.js';
 import { getDefaultARRAsOfDate, getUnifiedARRRecords } from './arr.js';
+import type { UnifiedARRRecord } from './arr.js';
 
 /**
  * Cohort retention analysis.
@@ -42,7 +43,7 @@ import { getDefaultARRAsOfDate, getUnifiedARRRecords } from './arr.js';
 export async function buildCohortAnalysis(
   options?: MetricOptions,
 ): Promise<CohortData[]> {
-  const endDate = options?.endDate ?? (await getDefaultARRAsOfDate());
+  const endDate = options?.endDate ?? getLastCompleteMonthEnd(await getDefaultARRAsOfDate());
   const startDate = options?.startDate ?? new Date(Date.UTC(2024, 0, 31, 23, 59, 59));
   const snapshots = new Map<string, Awaited<ReturnType<typeof getUnifiedARRRecords>>>();
   let cursor = monthStart(startDate);
@@ -104,15 +105,42 @@ export async function buildCohortAnalysis(
 }
 
 function summarize(records: Awaited<ReturnType<typeof getUnifiedARRRecords>>) {
-  const summary = new Map<string, { name: string; arr: number }>();
+  const grouped = new Map<
+    string,
+    {
+      name: string;
+      bySource: Map<UnifiedARRRecord['source'], number>;
+    }
+  >();
+
   for (const record of records) {
-    const current = summary.get(record.customerKey);
-    summary.set(record.customerKey, {
-      name: current?.name ?? record.companyName,
-      arr: (current?.arr ?? 0) + record.arr,
+    const current = grouped.get(record.customerKey) ?? {
+      name: record.companyName,
+      bySource: new Map<UnifiedARRRecord['source'], number>(),
+    };
+    current.bySource.set(record.source, (current.bySource.get(record.source) ?? 0) + record.arr);
+    grouped.set(record.customerKey, current);
+  }
+
+  const summary = new Map<string, { name: string; arr: number }>();
+  for (const [customerKey, customer] of grouped.entries()) {
+    summary.set(customerKey, {
+      name: customer.name,
+      arr: getPreferredARR(customer.bySource),
     });
   }
+
   return summary;
+}
+
+function getPreferredARR(bySource: Map<UnifiedARRRecord['source'], number>): number {
+  const chargebee = bySource.get('chargebee');
+  if (chargebee != null && chargebee > 0) return chargebee;
+
+  const stripe = bySource.get('stripe');
+  if (stripe != null && stripe > 0) return stripe;
+
+  return bySource.get('legacy') ?? 0;
 }
 
 function monthStart(date: Date): Date {
@@ -132,4 +160,13 @@ function addMonths(date: Date, months: number): Date {
   const next = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
   next.setUTCMonth(next.getUTCMonth() + months);
   return next;
+}
+
+function getLastCompleteMonthEnd(date: Date): Date {
+  const monthEnd = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0, 23, 59, 59));
+  if (date.getUTCDate() === monthEnd.getUTCDate()) {
+    return monthEnd;
+  }
+
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 0, 23, 59, 59));
 }

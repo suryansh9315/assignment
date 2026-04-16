@@ -3,11 +3,17 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadStripePayments } from '../ingestion/stripe.js';
 import { loadChargebeeSubscriptions } from '../ingestion/chargebee.js';
+import { loadLegacyInvoices } from '../ingestion/legacy.js';
 import { loadSalesforceData } from '../ingestion/salesforce.js';
 import { loadFXRates } from '../utils/fx.js';
 import { detectDuplicates } from '../reconciliation/deduplication.js';
 import { reconcileRevenue } from '../reconciliation/revenue.js';
-import { analyzePipelineQuality } from '../reconciliation/pipeline.js';
+import {
+  analyzePipelineQuality,
+  buildBillingSnapshots,
+  summarizeBillingByAccount,
+  type BillingSnapshot,
+} from '../reconciliation/pipeline.js';
 import { getDefaultARRAsOfDate } from '../metrics/arr.js';
 import {
   DiscrepancyType,
@@ -128,34 +134,41 @@ reconciliationRouter.get('/pipeline', async (_req, res, next) => {
   try {
     const dataDir = getDefaultDataDir();
     const asOfDate = await getDefaultARRAsOfDate();
-    const [[opportunities], chargebeeSubscriptions, stripePayments] = await Promise.all([
+    const [[opportunities], chargebeeSubscriptions, stripePayments, legacyInvoices] = await Promise.all([
       loadSalesforceData(dataDir),
       loadChargebeeSubscriptions(dataDir),
       loadStripePayments(dataDir),
+      loadLegacyInvoices(dataDir),
     ]);
-    const result = await analyzePipelineQuality(opportunities, [
-      ...chargebeeSubscriptions,
-      ...stripePayments,
-    ], { asOfDate });
+    const result = await analyzePipelineQuality(
+      opportunities,
+      [...chargebeeSubscriptions, ...stripePayments, ...legacyInvoices],
+      { asOfDate, amountToleranceFraction: 0.02 },
+    );
     return res.json(result);
   } catch (err) {
     return next(err);
   }
 });
 
-async function runFullReconciliation(options: Record<string, unknown>): Promise<ReconciliationResult> {
+export async function runFullReconciliation(options: Record<string, unknown>): Promise<ReconciliationResult> {
   const startedAt = new Date();
   const dataDir = getDefaultDataDir();
   const defaultPeriod = await getDefaultReconciliationPeriod();
   const startDate = parseDateOption(options.dateStart, defaultPeriod.startDate);
   const endDate = parseDateOption(options.dateEnd, defaultPeriod.endDate);
   const tolerance = typeof options.tolerance === 'number' ? options.tolerance : 0.5;
-  const [stripePayments, chargebeeSubscriptions, [opportunities], fxRates] = await Promise.all([
+  const [stripePayments, chargebeeSubscriptions, legacyInvoices, [opportunities], fxRates] = await Promise.all([
     loadStripePayments(dataDir),
     loadChargebeeSubscriptions(dataDir),
+    loadLegacyInvoices(dataDir),
     loadSalesforceData(dataDir),
     loadFXRates(join(dataDir, 'fx_rates.csv')),
   ]);
+  const billingSnapshots = buildBillingSnapshots(
+    [...chargebeeSubscriptions, ...stripePayments, ...legacyInvoices],
+    endDate,
+  );
   const [duplicates, revenue, pipeline] = await Promise.all([
     detectDuplicates(stripePayments, chargebeeSubscriptions),
     reconcileRevenue(chargebeeSubscriptions, stripePayments, fxRates, {
@@ -163,12 +176,37 @@ async function runFullReconciliation(options: Record<string, unknown>): Promise<
       endDate,
       toleranceUSD: tolerance,
     }),
-    analyzePipelineQuality(opportunities, [...chargebeeSubscriptions, ...stripePayments], {
+    analyzePipelineQuality(opportunities, [...chargebeeSubscriptions, ...stripePayments, ...legacyInvoices], {
       asOfDate: endDate,
+      amountToleranceFraction: 0.02,
     }),
   ]);
 
   const detectedAt = new Date().toISOString();
+  const billingCrossChecks = buildBillingMismatchDiscrepancies(billingSnapshots, detectedAt);
+  const crmMismatches = pipeline.mismatches.map((item, index) =>
+    createDiscrepancy({
+      id: `crm-${index + 1}`,
+      type: DiscrepancyType.AMOUNT_MISMATCH,
+      severity: getAmountSeverity(Math.abs(Number(item.billingValue) - Number(item.crmValue))),
+      sourceA: { system: 'salesforce', recordId: item.opportunityId, value: item.crmValue },
+      sourceB: {
+        system: item.billingSystems.length > 0 ? item.billingSystems.join('+') : 'billing',
+        recordId: item.opportunityId,
+        value: item.billingValue,
+      },
+      customerName: item.accountName,
+      amount: Math.abs(Number(item.billingValue) - Number(item.crmValue)),
+      percentDelta: item.percentDelta,
+      direction: item.direction,
+      scope: 'billing_vs_crm',
+      description:
+        item.billingSystems.length > 0
+          ? `${item.issue} (${item.billingSystems.join(', ')} active)`
+          : item.issue,
+      detectedAt,
+    }),
+  );
   const discrepancies: Discrepancy[] = [
     ...duplicates
       .filter((duplicate) => duplicate.classification === 'true_duplicate')
@@ -189,6 +227,15 @@ async function runFullReconciliation(options: Record<string, unknown>): Promise<
           },
           customerName: duplicate.chargebeeRecord.customerName,
           amount: Math.min(duplicate.stripeRecord.mrr, duplicate.chargebeeRecord.mrr) * 12,
+          percentDelta: calculatePercentDelta(
+            duplicate.chargebeeRecord.mrr * 12,
+            duplicate.stripeRecord.mrr * 12,
+          ),
+          direction:
+            duplicate.stripeRecord.mrr > duplicate.chargebeeRecord.mrr
+              ? 'stripe higher than chargebee'
+              : 'chargebee higher than stripe',
+          scope: 'duplicate_review',
           description: `Potential duplicate active subscription with ${duplicate.overlapDays} overlapping days.`,
           detectedAt,
         }),
@@ -207,26 +254,16 @@ async function runFullReconciliation(options: Record<string, unknown>): Promise<
           sourceB: { system: 'stripe', recordId: item.customerId, value: item.actual },
           customerName: item.customerName,
           amount: Math.abs(item.difference),
+          percentDelta: calculatePercentDelta(item.expected, item.actual),
+          direction:
+            item.actual > item.expected ? 'stripe higher than chargebee' : 'chargebee higher than stripe',
+          scope: 'billing_vs_billing',
           description: item.reason,
           detectedAt,
         }),
       ),
-    ...pipeline.mismatches.map((item, index) =>
-      createDiscrepancy({
-        id: `pipe-${index + 1}`,
-        type: DiscrepancyType.AMOUNT_MISMATCH,
-        severity: Severity.MEDIUM,
-        sourceA: { system: 'salesforce', recordId: item.opportunityId, value: item.crmValue },
-        sourceB: { system: 'billing', recordId: item.opportunityId, value: item.billingValue },
-        customerName: item.accountName,
-        amount:
-          typeof item.crmValue === 'number' && typeof item.billingValue === 'number'
-            ? Math.abs(item.crmValue - item.billingValue)
-            : null,
-        description: item.issue,
-        detectedAt,
-      }),
-    ),
+    ...billingCrossChecks,
+    ...crmMismatches,
   ].sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0));
 
   const completedAt = new Date();
@@ -236,10 +273,11 @@ async function runFullReconciliation(options: Record<string, unknown>): Promise<
       totalDiscrepancies: discrepancies.length,
       bySeverity: countBy(Object.values(Severity), discrepancies, (item) => item.severity),
       byType: countBy(Object.values(DiscrepancyType), discrepancies, (item) => item.type),
-      totalAmountImpact: Math.round(calculateBillingExposure(discrepancies)),
+      totalAmountImpact: Math.round(calculateCRMImpact(discrepancies)),
       recordsProcessed: {
         stripe: stripePayments.length,
         chargebee: chargebeeSubscriptions.length,
+        legacy: legacyInvoices.length,
         salesforce_opportunities: opportunities.length,
       },
     },
@@ -285,16 +323,68 @@ function createDiscrepancy(input: Omit<Discrepancy, 'resolved' | 'resolutionNote
   return { ...input, resolved: false, resolutionNote: null };
 }
 
-function calculateBillingExposure(discrepancies: Discrepancy[]): number {
+function calculateCRMImpact(discrepancies: Discrepancy[]): number {
   return discrepancies
-    .filter(
-      (item) =>
-        item.sourceA.system === 'chargebee' ||
-        item.sourceA.system === 'stripe' ||
-        item.sourceB.system === 'chargebee' ||
-        item.sourceB.system === 'stripe',
-    )
+    .filter((item) => item.scope === 'billing_vs_crm')
     .reduce((sum, item) => sum + Math.abs(item.amount ?? 0), 0);
+}
+
+function buildBillingMismatchDiscrepancies(
+  billingSnapshots: BillingSnapshot[],
+  detectedAt: string,
+): Discrepancy[] {
+  const accounts = summarizeBillingByAccount(billingSnapshots);
+  const mismatches: Discrepancy[] = [];
+  let index = 1;
+
+  for (const account of accounts.values()) {
+    if (account.systems.length < 2) continue;
+
+    for (let left = 0; left < account.systems.length - 1; left += 1) {
+      for (let right = left + 1; right < account.systems.length; right += 1) {
+        const sourceA = account.systems[left]!;
+        const sourceB = account.systems[right]!;
+        const percentDelta = calculatePercentDelta(sourceA.annualAmount, sourceB.annualAmount);
+        if (percentDelta <= 2) continue;
+
+        mismatches.push(
+          createDiscrepancy({
+            id: `bill-${index}`,
+            type: DiscrepancyType.AMOUNT_MISMATCH,
+            severity: getAmountSeverity(Math.abs(sourceA.annualAmount - sourceB.annualAmount)),
+            sourceA: {
+              system: sourceA.system,
+              recordId: sourceA.recordId,
+              value: Math.round(sourceA.annualAmount),
+            },
+            sourceB: {
+              system: sourceB.system,
+              recordId: sourceB.recordId,
+              value: Math.round(sourceB.annualAmount),
+            },
+            customerName: account.customerName,
+            amount: Math.round(Math.abs(sourceA.annualAmount - sourceB.annualAmount)),
+            percentDelta,
+            direction:
+              sourceA.annualAmount > sourceB.annualAmount
+                ? `${sourceA.system} higher than ${sourceB.system}`
+                : `${sourceB.system} higher than ${sourceA.system}`,
+            scope: 'billing_vs_billing',
+            description: 'Active billing systems disagree on recurring annualized revenue.',
+            detectedAt,
+          }),
+        );
+        index += 1;
+      }
+    }
+  }
+
+  return mismatches;
+}
+
+function calculatePercentDelta(left: number, right: number): number {
+  const base = Math.max(Math.abs(left), Math.abs(right), 1);
+  return Number((Math.abs(left - right) / base * 100).toFixed(2));
 }
 
 function countBy<T extends string>(

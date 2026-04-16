@@ -52,6 +52,16 @@ type TooltipPayload = {
   payload?: Record<string, unknown>;
 };
 
+type OutlierSummary = {
+  hasOutlier: boolean;
+  outlierMonth: string | null;
+  outlierValue: number;
+  previousPeak: number;
+  ratioToPreviousPeak: number;
+  fullDomainMax: number;
+  baselineDomainMax: number;
+};
+
 function formatCurrency(value: number): string {
   return currencyFormatter.format(value);
 }
@@ -64,10 +74,67 @@ function formatPercent(value: number): string {
   return `${value.toFixed(1)}%`;
 }
 
+function roundAxisMax(value: number): number {
+  if (value <= 0) return 0;
+
+  const magnitude = 10 ** Math.floor(Math.log10(value));
+  const normalized = value / magnitude;
+
+  if (normalized <= 1) return magnitude;
+  if (normalized <= 2) return 2 * magnitude;
+  if (normalized <= 5) return 5 * magnitude;
+  return 10 * magnitude;
+}
+
 function getMonthLabel(month: string): string {
   const [year, monthNumber] = month.split('-');
   const date = new Date(Number(year), Number(monthNumber) - 1, 1);
   return date.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+}
+
+function getOutlierSummary(points: Array<{ month: string; value: number }>): OutlierSummary {
+  const sorted = [...points].sort((a, b) => b.value - a.value);
+  const largest = sorted[0];
+  const secondLargest = sorted[1];
+
+  if (!largest) {
+    return {
+      hasOutlier: false,
+      outlierMonth: null,
+      outlierValue: 0,
+      previousPeak: 0,
+      ratioToPreviousPeak: 0,
+      fullDomainMax: 0,
+      baselineDomainMax: 0,
+    };
+  }
+
+  if (!secondLargest) {
+    const domain = roundAxisMax(largest.value * 1.1);
+    return {
+      hasOutlier: false,
+      outlierMonth: largest.month,
+      outlierValue: largest.value,
+      previousPeak: largest.value,
+      ratioToPreviousPeak: 1,
+      fullDomainMax: domain,
+      baselineDomainMax: domain,
+    };
+  }
+
+  const hasOutlier =
+    largest.value >= secondLargest.value * 4 && largest.value - secondLargest.value >= 100_000;
+
+  return {
+    hasOutlier,
+    outlierMonth: largest.month,
+    outlierValue: largest.value,
+    previousPeak: secondLargest.value,
+    ratioToPreviousPeak:
+      secondLargest.value === 0 ? 0 : Number((largest.value / secondLargest.value).toFixed(1)),
+    fullDomainMax: roundAxisMax(largest.value * 1.08),
+    baselineDomainMax: roundAxisMax((hasOutlier ? secondLargest.value : largest.value) * 1.15),
+  };
 }
 
 function getARRChange(data: RevenueSummaryResult): number {
@@ -142,6 +209,25 @@ function ChartTooltip({
   );
 }
 
+function OutlierNotice({
+  summary,
+  label,
+}: {
+  summary: OutlierSummary;
+  label: string;
+}) {
+  if (!summary.hasOutlier || !summary.outlierMonth) return null;
+
+  return (
+    <div className="rounded-lg border border-sky-500/30 bg-sky-950/20 px-3 py-2 text-xs text-sky-100">
+      <span className="font-semibold text-sky-200">{label} baseline zoom:</span>{' '}
+      {getMonthLabel(summary.outlierMonth)} reaches {formatCompactCurrency(summary.outlierValue)},
+      about {summary.ratioToPreviousPeak}x the prior peak of{' '}
+      {formatCompactCurrency(summary.previousPeak)}. The companion zoom keeps earlier months readable.
+    </div>
+  );
+}
+
 function LoadingState() {
   return (
     <div className="p-6">
@@ -179,9 +265,42 @@ export function RevenueSummary() {
   const arrChange = getARRChange(data);
   const latestGrowth = getLatestMonthlyGrowth(data);
   const latestMonth = data.monthly[data.monthly.length - 1];
+  const arrChartData = data.monthly.map((point) => ({
+    month: getMonthLabel(point.month),
+    ARR: point.arr,
+    'MRR run rate': point.mrrRunRate,
+  }));
   const movementData = getMovementData(data);
   const planTrendData = getPlanTrendData(data);
   const planLabels = data.planMix.slice(0, 5).map((plan) => plan.label);
+  const arrOutlier = getOutlierSummary(
+    data.monthly.map((point) => ({ month: point.month, value: point.arr })),
+  );
+  const movementOutlier = getOutlierSummary(
+    movementData.map((point, index) => ({
+      month: data.monthly[index]?.month ?? point.month,
+      value:
+        Math.max(point.newBusiness + point.expansion, Math.abs(point.contraction) + Math.abs(point.churn)),
+    })),
+  );
+  const planTrendOutlier = getOutlierSummary(
+    data.monthly.map((point) => ({
+      month: point.month,
+      value: point.byPlan.reduce((sum, plan) => sum + plan.arr, 0),
+    })),
+  );
+  const movementNegativePeak = Math.max(
+    ...movementData.map((point) => Math.abs(point.contraction) + Math.abs(point.churn)),
+    0,
+  );
+  const movementFullDomain = Math.max(
+    movementOutlier.fullDomainMax,
+    roundAxisMax(movementNegativePeak * 1.1),
+  );
+  const movementBaselineDomain = Math.max(
+    movementOutlier.baselineDomainMax,
+    roundAxisMax(movementNegativePeak * 1.1),
+  );
 
   return (
     <div className="space-y-6 p-6">
@@ -244,41 +363,82 @@ export function RevenueSummary() {
               Month-end ARR snapshots with monthly recurring run-rate shown for explainability.
             </p>
           </div>
-          <div className="h-80">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={data.monthly.map((point) => ({
-                month: getMonthLabel(point.month),
-                ARR: point.arr,
-                'MRR run rate': point.mrrRunRate,
-              }))}>
-                <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="month" tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} />
-                <YAxis
-                  tickFormatter={formatCompactCurrency}
-                  tick={{ fill: '#64748b', fontSize: 11 }}
-                  tickLine={false}
-                  width={72}
-                />
-                <Tooltip content={<ChartTooltip />} />
-                <Legend wrapperStyle={{ color: '#94a3b8', fontSize: 12 }} />
-                <Area
-                  dataKey="ARR"
-                  name="ARR"
-                  stroke="#3b82f6"
-                  fill="#3b82f6"
-                  fillOpacity={0.15}
-                  strokeWidth={2}
-                />
-                <Area
-                  dataKey="MRR run rate"
-                  name="MRR run rate"
-                  stroke="#22c55e"
-                  fill="#22c55e"
-                  fillOpacity={0.08}
-                  strokeWidth={2}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+          <div className="space-y-4">
+            <OutlierNotice summary={arrOutlier} label="ARR and MRR" />
+            <div className="h-80">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={arrChartData}>
+                  <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="month" tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} />
+                  <YAxis
+                    tickFormatter={formatCompactCurrency}
+                    tick={{ fill: '#64748b', fontSize: 11 }}
+                    tickLine={false}
+                    width={72}
+                    domain={[0, arrOutlier.fullDomainMax]}
+                    allowDataOverflow
+                  />
+                  <Tooltip content={<ChartTooltip />} />
+                  <Legend wrapperStyle={{ color: '#94a3b8', fontSize: 12 }} />
+                  <Area
+                    dataKey="ARR"
+                    name="ARR"
+                    stroke="#3b82f6"
+                    fill="#3b82f6"
+                    fillOpacity={0.15}
+                    strokeWidth={2}
+                  />
+                  <Area
+                    dataKey="MRR run rate"
+                    name="MRR run rate"
+                    stroke="#22c55e"
+                    fill="#22c55e"
+                    fillOpacity={0.08}
+                    strokeWidth={2}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+            {arrOutlier.hasOutlier ? (
+              <div className="rounded-lg border border-slate-700 bg-slate-900/70 p-3">
+                <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  Baseline Zoom
+                </div>
+                <div className="h-44">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={arrChartData}>
+                      <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
+                      <XAxis dataKey="month" tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} />
+                      <YAxis
+                        tickFormatter={formatCompactCurrency}
+                        tick={{ fill: '#64748b', fontSize: 11 }}
+                        tickLine={false}
+                        width={72}
+                        domain={[0, arrOutlier.baselineDomainMax]}
+                        allowDataOverflow
+                      />
+                      <Tooltip content={<ChartTooltip />} />
+                      <Area
+                        dataKey="ARR"
+                        name="ARR"
+                        stroke="#3b82f6"
+                        fill="#3b82f6"
+                        fillOpacity={0.15}
+                        strokeWidth={2}
+                      />
+                      <Area
+                        dataKey="MRR run rate"
+                        name="MRR run rate"
+                        stroke="#22c55e"
+                        fill="#22c55e"
+                        fillOpacity={0.08}
+                        strokeWidth={2}
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            ) : null}
           </div>
         </section>
 
@@ -327,25 +487,58 @@ export function RevenueSummary() {
             Contraction and churn are plotted below zero.
           </div>
         </div>
-        <div className="h-96">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={movementData}>
-              <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
-              <XAxis dataKey="month" tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} />
-              <YAxis
-                tickFormatter={formatCompactCurrency}
-                tick={{ fill: '#64748b', fontSize: 11 }}
-                tickLine={false}
-                width={72}
-              />
-              <Tooltip content={<ChartTooltip />} />
-              <Legend wrapperStyle={{ color: '#94a3b8', fontSize: 12 }} />
-              <Bar dataKey="newBusiness" name="New business" stackId="positive" fill={movementColors.newBusiness} />
-              <Bar dataKey="expansion" name="Expansion" stackId="positive" fill={movementColors.expansion} />
-              <Bar dataKey="contraction" name="Contraction" stackId="negative" fill={movementColors.contraction} />
-              <Bar dataKey="churn" name="Churn" stackId="negative" fill={movementColors.churn} />
-            </BarChart>
-          </ResponsiveContainer>
+        <div className="space-y-4">
+          <OutlierNotice summary={movementOutlier} label="Waterfall" />
+          <div className="h-96">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={movementData}>
+                <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
+                <XAxis dataKey="month" tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} />
+                <YAxis
+                  tickFormatter={formatCompactCurrency}
+                  tick={{ fill: '#64748b', fontSize: 11 }}
+                  tickLine={false}
+                  width={72}
+                  domain={[-movementFullDomain, movementFullDomain]}
+                  allowDataOverflow
+                />
+                <Tooltip content={<ChartTooltip />} />
+                <Legend wrapperStyle={{ color: '#94a3b8', fontSize: 12 }} />
+                <Bar dataKey="newBusiness" name="New business" stackId="positive" fill={movementColors.newBusiness} />
+                <Bar dataKey="expansion" name="Expansion" stackId="positive" fill={movementColors.expansion} />
+                <Bar dataKey="contraction" name="Contraction" stackId="negative" fill={movementColors.contraction} />
+                <Bar dataKey="churn" name="Churn" stackId="negative" fill={movementColors.churn} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          {movementOutlier.hasOutlier ? (
+            <div className="rounded-lg border border-slate-700 bg-slate-900/70 p-3">
+              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                Baseline Zoom
+              </div>
+              <div className="h-44">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={movementData}>
+                    <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
+                    <XAxis dataKey="month" tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} />
+                    <YAxis
+                      tickFormatter={formatCompactCurrency}
+                      tick={{ fill: '#64748b', fontSize: 11 }}
+                      tickLine={false}
+                      width={72}
+                      domain={[-movementBaselineDomain, movementBaselineDomain]}
+                      allowDataOverflow
+                    />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Bar dataKey="newBusiness" name="New business" stackId="positive" fill={movementColors.newBusiness} />
+                    <Bar dataKey="expansion" name="Expansion" stackId="positive" fill={movementColors.expansion} />
+                    <Bar dataKey="contraction" name="Contraction" stackId="negative" fill={movementColors.contraction} />
+                    <Bar dataKey="churn" name="Churn" stackId="negative" fill={movementColors.churn} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          ) : null}
         </div>
       </section>
 
@@ -355,31 +548,70 @@ export function RevenueSummary() {
             <h2 className="text-lg font-semibold text-slate-100">Plan Tier Trend</h2>
             <p className="mt-1 text-sm text-slate-500">Month-end ARR by current plan family.</p>
           </div>
-          <div className="h-80">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={planTrendData}>
-                <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="month" tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} />
-                <YAxis
-                  tickFormatter={formatCompactCurrency}
-                  tick={{ fill: '#64748b', fontSize: 11 }}
-                  tickLine={false}
-                  width={72}
-                />
-                <Tooltip content={<ChartTooltip />} />
-                <Legend wrapperStyle={{ color: '#94a3b8', fontSize: 12 }} />
-                {planLabels.map((label, index) => (
-                  <Bar key={label} dataKey={label} stackId="plan" name={label}>
-                    {planTrendData.map((row) => (
-                      <Cell
-                        key={`${label}-${row.month}`}
-                        fill={planColors[index % planColors.length]}
+          <div className="space-y-4">
+            <OutlierNotice summary={planTrendOutlier} label="Plan tier" />
+            <div className="h-80">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={planTrendData}>
+                  <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="month" tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} />
+                  <YAxis
+                    tickFormatter={formatCompactCurrency}
+                    tick={{ fill: '#64748b', fontSize: 11 }}
+                    tickLine={false}
+                    width={72}
+                    domain={[0, planTrendOutlier.fullDomainMax]}
+                    allowDataOverflow
+                  />
+                  <Tooltip content={<ChartTooltip />} />
+                  <Legend wrapperStyle={{ color: '#94a3b8', fontSize: 12 }} />
+                  {planLabels.map((label, index) => (
+                    <Bar key={label} dataKey={label} stackId="plan" name={label}>
+                      {planTrendData.map((row) => (
+                        <Cell
+                          key={`${label}-${row.month}`}
+                          fill={planColors[index % planColors.length]}
+                        />
+                      ))}
+                    </Bar>
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            {planTrendOutlier.hasOutlier ? (
+              <div className="rounded-lg border border-slate-700 bg-slate-900/70 p-3">
+                <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  Baseline Zoom
+                </div>
+                <div className="h-44">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={planTrendData}>
+                      <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
+                      <XAxis dataKey="month" tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} />
+                      <YAxis
+                        tickFormatter={formatCompactCurrency}
+                        tick={{ fill: '#64748b', fontSize: 11 }}
+                        tickLine={false}
+                        width={72}
+                        domain={[0, planTrendOutlier.baselineDomainMax]}
+                        allowDataOverflow
                       />
-                    ))}
-                  </Bar>
-                ))}
-              </BarChart>
-            </ResponsiveContainer>
+                      <Tooltip content={<ChartTooltip />} />
+                      {planLabels.map((label, index) => (
+                        <Bar key={label} dataKey={label} stackId="plan" name={label}>
+                          {planTrendData.map((row) => (
+                            <Cell
+                              key={`${label}-${row.month}`}
+                              fill={planColors[index % planColors.length]}
+                            />
+                          ))}
+                        </Bar>
+                      ))}
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            ) : null}
           </div>
         </section>
 

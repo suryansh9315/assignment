@@ -68,6 +68,12 @@ export interface Discrepancy {
   customerName: string;
   /** Dollar amount of the discrepancy (absolute difference), if applicable. */
   amount: number | null;
+  /** Percent delta relative to the larger absolute side, if applicable. */
+  percentDelta?: number | null;
+  /** Human-readable direction of the mismatch. */
+  direction?: string | null;
+  /** Categorizes whether the discrepancy is CRM-facing, cross-billing, or duplicate review. */
+  scope?: 'billing_vs_crm' | 'billing_vs_billing' | 'duplicate_review' | 'pipeline_review';
   /** Human-readable description of what was found. */
   description: string;
   /** ISO-8601 timestamp when this discrepancy was detected. */
@@ -204,6 +210,9 @@ export interface PipelineAnalysisResult {
     issue: string;
     crmValue: string | number;
     billingValue: string | number;
+    billingSystems: string[];
+    percentDelta: number;
+    direction: 'over-reporting' | 'under-reporting';
   }[];
   /** Subscriptions in billing systems with no matching CRM opportunity. */
   unbookedRevenue: {

@@ -1,32 +1,44 @@
 import type { PipelineAnalysisResult } from './types.js';
-import type { SalesforceOpportunity, ChargebeeSubscription, StripePayment } from '../ingestion/types.js';
+import type {
+  ChargebeeSubscription,
+  LegacyInvoice,
+  SalesforceOpportunity,
+  StripePayment,
+} from '../ingestion/types.js';
 import { normalizeCompanyName } from '../utils/normalization.js';
+
+export type BillingSnapshot = {
+  system: 'chargebee' | 'stripe' | 'legacy';
+  customerKey: string;
+  customerName: string;
+  recordId: string;
+  monthlyAmount: number;
+  annualAmount: number;
+  activeStart: string;
+  activeEnd: string | null;
+};
+
+export type BillingAccountSummary = {
+  customerKey: string;
+  customerName: string;
+  monthlyAmount: number;
+  annualAmount: number;
+  systems: BillingSnapshot[];
+};
+
+type ActiveOpportunitySummary = {
+  accountName: string;
+  opportunityId: string;
+  opportunityIds: string[];
+  acv: number;
+};
 
 /**
  * CRM pipeline quality analysis.
  *
- * Identifies data quality issues in the Salesforce pipeline by cross-
- * referencing CRM data against billing system data.  Key analyses:
- *
- * - **Zombie deals**: Open opportunities that have had no stage change,
- *   amount update, or close-date change in 90+ days.  These inflate
- *   pipeline value and distort forecasts.
- *
- * - **Stage mismatches**: Opportunities marked as "Closed Won" in
- *   Salesforce but with no corresponding active subscription in the
- *   billing system (or vice versa -- active subscriptions with no
- *   "Closed Won" opportunity).
- *
- * - **Amount discrepancies**: The opportunity ACV in Salesforce differs
- *   significantly from the subscription MRR * 12 in the billing system.
- *
- * - **Unbooked revenue**: Subscriptions in Stripe or Chargebee that
- *   have no matching opportunity in Salesforce, meaning revenue is
- *   being collected but not tracked in the CRM.
- *
- * - **Pipeline-to-billing lag**: Opportunities that were closed recently
- *   but subscription activation is delayed, or subscriptions that were
- *   activated before the opportunity was marked as closed.
+ * Closed-won CRM amounts are compared to the total active recurring billing
+ * footprint for the same account, while preserving source-system detail for
+ * drill-down. Billing coverage now includes Stripe, Chargebee, and Legacy.
  *
  * @module reconciliation/pipeline
  */
@@ -35,7 +47,7 @@ import { normalizeCompanyName } from '../utils/normalization.js';
 export interface PipelineAnalysisOptions {
   /** Number of days with no activity to flag as zombie. Defaults to 90. */
   zombieThresholdDays?: number;
-  /** Tolerance for ACV vs billing amount comparison (as a fraction). Defaults to 0.10 (10%). */
+  /** Tolerance for ACV vs billing amount comparison (as a fraction). Defaults to 0.02 (2%). */
   amountToleranceFraction?: number;
   /** Whether to include closed-lost opportunities in the analysis. Defaults to false. */
   includeClosedLost?: boolean;
@@ -43,26 +55,20 @@ export interface PipelineAnalysisOptions {
   asOfDate?: Date;
 }
 
-/**
- * Analyze CRM pipeline quality against billing data.
- *
- * @param opportunities - Salesforce opportunity records
- * @param subscriptions - Active subscriptions from billing systems
- * @param options - Analysis options
- * @returns Pipeline quality analysis with zombie deals, mismatches, and unbooked revenue
- */
 export async function analyzePipelineQuality(
   opportunities: SalesforceOpportunity[],
-  subscriptions: (ChargebeeSubscription | StripePayment)[],
+  billingRecords: (ChargebeeSubscription | StripePayment | LegacyInvoice)[],
   options?: PipelineAnalysisOptions,
 ): Promise<PipelineAnalysisResult> {
   const zombieThresholdDays = options?.zombieThresholdDays ?? 90;
-  const tolerance = options?.amountToleranceFraction ?? 0.1;
-  const asOfDate = options?.asOfDate ?? getAnalysisDate(opportunities, subscriptions);
-  const billing = buildBillingIndex(subscriptions, asOfDate);
+  const tolerance = options?.amountToleranceFraction ?? 0.02;
+  const asOfDate = options?.asOfDate ?? getAnalysisDate(opportunities, billingRecords);
+  const billingSnapshots = buildBillingSnapshots(billingRecords, asOfDate);
+  const billing = summarizeBillingByAccount(billingSnapshots);
   const closedWon = opportunities.filter(
     (opp) => opp.stage.toLowerCase() === 'closed won' && isOpportunityActiveAsOf(opp, asOfDate),
   );
+  const crm = summarizeOpportunities(closedWon);
   const openOpportunities = opportunities.filter((opp) =>
     options?.includeClosedLost
       ? opp.stage.toLowerCase() !== 'closed won'
@@ -81,41 +87,45 @@ export async function analyzePipelineQuality(
     .sort((a, b) => b.amount - a.amount);
 
   const mismatches: PipelineAnalysisResult['mismatches'] = [];
-  for (const opp of closedWon) {
-    const billingRecord = billing.byName.get(normalizeCompanyName(opp.account_name));
-    if (!billingRecord) {
-      mismatches.push({
-        opportunityId: opp.opportunity_id,
-        accountName: opp.account_name,
-        issue: 'Closed-won CRM opportunity has no active billing record',
-        crmValue: opp.acv,
-        billingValue: 0,
-      });
-      continue;
-    }
+  const accountKeys = new Set([...crm.keys(), ...billing.keys()]);
+  for (const customerKey of accountKeys) {
+    const crmRecord = crm.get(customerKey);
+    const billingRecord = billing.get(customerKey);
+    const crmValue = Math.round(crmRecord?.acv ?? 0);
+    const billingValue = Math.round(billingRecord?.annualAmount ?? 0);
+    const base = Math.max(Math.abs(crmValue), Math.abs(billingValue), 1);
+    const percentDelta = Number((((billingValue - crmValue) / base) * 100).toFixed(2));
 
-    const billingARR = billingRecord.mrr * 12;
-    const base = Math.max(Math.abs(opp.acv), Math.abs(billingARR), 1);
-    if (Math.abs(opp.acv - billingARR) / base > tolerance) {
-      mismatches.push({
-        opportunityId: opp.opportunity_id,
-        accountName: opp.account_name,
-        issue: 'CRM ACV differs from active billing ARR',
-        crmValue: Math.round(opp.acv),
-        billingValue: Math.round(billingARR),
-      });
-    }
+    if (Math.abs(percentDelta) <= tolerance * 100) continue;
+
+    const billingSystems = billingRecord?.systems.map((item) => item.system) ?? [];
+    mismatches.push({
+      opportunityId: crmRecord?.opportunityId ?? `billing-${customerKey}`,
+      accountName: crmRecord?.accountName ?? billingRecord?.customerName ?? customerKey,
+      issue:
+        crmRecord == null
+          ? 'Active billing has no matching closed-won CRM amount'
+          : billingRecord == null
+            ? 'Closed-won CRM amount has no active billing record'
+            : 'Active billing total differs from CRM ACV',
+      crmValue,
+      billingValue,
+      billingSystems,
+      percentDelta: Math.abs(percentDelta),
+      direction: billingValue > crmValue ? 'over-reporting' : 'under-reporting',
+    });
   }
 
-  const closedWonNames = new Set(closedWon.map((opp) => normalizeCompanyName(opp.account_name)));
-  const unbookedRevenue = Array.from(billing.byName.values())
-    .filter((record) => !closedWonNames.has(record.customerKey))
-    .map((record) => ({
-      subscriptionId: record.subscriptionId,
-      customerName: record.customerName,
-      mrr: Math.round(record.mrr),
-      system: record.system,
-    }))
+  const unbookedRevenue = Array.from(billing.values())
+    .filter((record) => !crm.has(record.customerKey))
+    .flatMap((record) =>
+      record.systems.map((system) => ({
+        subscriptionId: system.recordId,
+        customerName: system.customerName,
+        mrr: Math.round(system.monthlyAmount),
+        system: system.system,
+      })),
+    )
     .sort((a, b) => b.mrr - a.mrr);
 
   const totalZombieValue = zombieDeals.reduce((sum, deal) => sum + deal.amount, 0);
@@ -124,7 +134,7 @@ export async function analyzePipelineQuality(
 
   return {
     zombieDeals,
-    mismatches,
+    mismatches: mismatches.sort((a, b) => Number(billingMagnitude(b) - billingMagnitude(a))),
     unbookedRevenue,
     summary: {
       totalZombieDeals: zombieDeals.length,
@@ -136,70 +146,204 @@ export async function analyzePipelineQuality(
   };
 }
 
-type BillingRecord = {
-  customerKey: string;
-  customerName: string;
-  subscriptionId: string;
-  mrr: number;
-  system: string;
-  date: string;
-};
+export function buildBillingSnapshots(
+  billingRecords: (ChargebeeSubscription | StripePayment | LegacyInvoice)[],
+  asOfDate: Date,
+): BillingSnapshot[] {
+  const chargebee = billingRecords.filter(isChargebeeSubscription);
+  const stripe = billingRecords.filter(isStripePayment);
+  const legacy = billingRecords.filter(isLegacyInvoice);
 
-function buildBillingIndex(subscriptions: (ChargebeeSubscription | StripePayment)[], asOfDate: Date) {
-  const byName = new Map<string, BillingRecord>();
+  const snapshots: BillingSnapshot[] = [
+    ...chargebee
+      .filter((subscription) => isChargebeeActiveAsOf(subscription, asOfDate))
+      .map((subscription) => ({
+        system: 'chargebee' as const,
+        customerKey: normalizeCompanyName(subscription.customer.company),
+        customerName: subscription.customer.company,
+        recordId: subscription.subscription_id,
+        monthlyAmount: roundMoney(getChargebeeMRR(subscription)),
+        annualAmount: roundMoney(getChargebeeMRR(subscription) * 12),
+        activeStart: subscription.current_term_start,
+        activeEnd: subscription.current_term_end,
+      })),
+    ...aggregateStripeSnapshots(stripe).filter((snapshot) => isSnapshotActiveAsOf(snapshot, asOfDate)),
+    ...aggregateLegacySnapshots(legacy).filter((snapshot) => isSnapshotActiveAsOf(snapshot, asOfDate)),
+  ];
 
-  for (const item of subscriptions) {
-    if (!isBillingRecordActiveAsOf(item, asOfDate)) continue;
+  return snapshots.filter((snapshot) => snapshot.monthlyAmount > 0);
+}
 
-    const record = isChargebeeSubscription(item)
-      ? {
-          customerKey: normalizeCompanyName(item.customer.company),
-          customerName: item.customer.company,
-          subscriptionId: item.subscription_id,
-          mrr: item.mrr,
-          system: 'chargebee',
-          date: item.current_term_start,
-        }
-      : {
-          customerKey: normalizeCompanyName(item.customer_name),
-          customerName: item.customer_name,
-          subscriptionId: item.subscription_id ?? item.payment_id,
-          mrr: item.status === 'succeeded' ? item.amount : 0,
-          system: 'stripe',
-          date: item.payment_date,
-        };
+export function summarizeBillingByAccount(
+  snapshots: BillingSnapshot[],
+): Map<string, BillingAccountSummary> {
+  const summary = new Map<string, BillingAccountSummary>();
 
-    if (record.mrr <= 0) continue;
-    const existing = byName.get(record.customerKey);
-    if (!existing || record.mrr > existing.mrr) byName.set(record.customerKey, record);
+  for (const snapshot of snapshots) {
+    const existing = summary.get(snapshot.customerKey);
+    if (!existing) {
+      summary.set(snapshot.customerKey, {
+        customerKey: snapshot.customerKey,
+        customerName: snapshot.customerName,
+        monthlyAmount: snapshot.monthlyAmount,
+        annualAmount: snapshot.annualAmount,
+        systems: [snapshot],
+      });
+      continue;
+    }
+
+    existing.monthlyAmount = roundMoney(existing.monthlyAmount + snapshot.monthlyAmount);
+    existing.annualAmount = roundMoney(existing.annualAmount + snapshot.annualAmount);
+    existing.systems.push(snapshot);
   }
 
-  return { byName };
+  return summary;
+}
+
+function summarizeOpportunities(
+  opportunities: SalesforceOpportunity[],
+): Map<string, ActiveOpportunitySummary> {
+  const summary = new Map<string, ActiveOpportunitySummary>();
+
+  for (const opportunity of opportunities) {
+    const customerKey = normalizeCompanyName(opportunity.account_name);
+    const existing = summary.get(customerKey);
+    if (!existing) {
+      summary.set(customerKey, {
+        accountName: opportunity.account_name,
+        opportunityId: opportunity.opportunity_id,
+        opportunityIds: [opportunity.opportunity_id],
+        acv: Math.round(opportunity.acv),
+      });
+      continue;
+    }
+
+    existing.acv = Math.round(existing.acv + opportunity.acv);
+    existing.opportunityIds.push(opportunity.opportunity_id);
+  }
+
+  return summary;
+}
+
+function billingMagnitude(
+  mismatch: PipelineAnalysisResult['mismatches'][number],
+): number {
+  return Math.max(Math.abs(Number(mismatch.crmValue)), Math.abs(Number(mismatch.billingValue)));
+}
+
+function aggregateStripeSnapshots(payments: StripePayment[]): BillingSnapshot[] {
+  const grouped = new Map<string, StripePayment[]>();
+
+  for (const payment of payments) {
+    if (payment.status === 'failed' || payment.status === 'pending') continue;
+    const subscriptionId = payment.subscription_id ?? payment.customer_id;
+    const key = `${payment.customer_id}::${subscriptionId}`;
+    const group = grouped.get(key) ?? [];
+    group.push(payment);
+    grouped.set(key, group);
+  }
+
+  return Array.from(grouped.values()).map((group) => {
+    const sorted = [...group].sort(
+      (a, b) => new Date(a.payment_date).getTime() - new Date(b.payment_date).getTime(),
+    );
+    const latest = sorted[sorted.length - 1]!;
+    const positiveAmounts = sorted
+      .filter((payment) => payment.status === 'succeeded' && payment.amount > 0)
+      .map((payment) => payment.amount);
+    const monthlyAmount =
+      positiveAmounts.length === 0
+        ? 0
+        : positiveAmounts.reduce((sum, amount) => sum + amount, 0) / positiveAmounts.length;
+    const cycleDays = getMedianGapDays(
+      sorted
+        .filter((payment) => payment.status === 'succeeded')
+        .map((payment) => payment.payment_date),
+    );
+
+    return {
+      system: 'stripe' as const,
+      customerKey: normalizeCompanyName(latest.customer_name),
+      customerName: latest.customer_name,
+      recordId: latest.subscription_id ?? latest.payment_id,
+      monthlyAmount: roundMoney(monthlyAmount),
+      annualAmount: roundMoney(monthlyAmount * 12),
+      activeStart: sorted[0]!.payment_date,
+      activeEnd: addDays(latest.payment_date, cycleDays),
+    };
+  });
+}
+
+function aggregateLegacySnapshots(invoices: LegacyInvoice[]): BillingSnapshot[] {
+  const grouped = new Map<string, LegacyInvoice[]>();
+
+  for (const invoice of invoices) {
+    if (invoice.status === 'void' || invoice.status === 'unpaid') continue;
+    const customerKey = normalizeCompanyName(invoice.customer_name);
+    const group = grouped.get(customerKey) ?? [];
+    group.push(invoice);
+    grouped.set(customerKey, group);
+  }
+
+  return Array.from(grouped.entries()).map(([customerKey, group]) => {
+    const sorted = [...group].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+    const latest = sorted[sorted.length - 1]!;
+    const positiveAmounts = sorted.map((invoice) => invoice.amount).filter((amount) => amount > 0);
+    const monthlyAmount =
+      positiveAmounts.length === 0
+        ? 0
+        : positiveAmounts.reduce((sum, amount) => sum + amount, 0) / positiveAmounts.length;
+    const cycleDays = getMedianGapDays(sorted.map((invoice) => invoice.date));
+
+    return {
+      system: 'legacy' as const,
+      customerKey,
+      customerName: latest.customer_name,
+      recordId: latest.id,
+      monthlyAmount: roundMoney(monthlyAmount),
+      annualAmount: roundMoney(monthlyAmount * 12),
+      activeStart: sorted[0]!.date,
+      activeEnd: addDays(latest.date, cycleDays),
+    };
+  });
+}
+
+function getChargebeeMRR(subscription: ChargebeeSubscription): number {
+  const mrrUsd = subscription.metadata['mrr_usd'];
+  return typeof mrrUsd === 'number' && Number.isFinite(mrrUsd) ? mrrUsd : subscription.mrr;
+}
+
+function isSnapshotActiveAsOf(snapshot: BillingSnapshot, asOfDate: Date): boolean {
+  const start = new Date(snapshot.activeStart).getTime();
+  const end =
+    snapshot.activeEnd == null ? Number.POSITIVE_INFINITY : new Date(snapshot.activeEnd).getTime();
+  return start <= asOfDate.getTime() && asOfDate.getTime() <= end;
 }
 
 function isChargebeeSubscription(
-  value: ChargebeeSubscription | StripePayment,
+  value: ChargebeeSubscription | StripePayment | LegacyInvoice,
 ): value is ChargebeeSubscription {
   return 'subscription_id' in value && 'customer' in value;
 }
 
-function isBillingRecordActiveAsOf(
-  value: ChargebeeSubscription | StripePayment,
-  asOfDate: Date,
-): boolean {
-  if (isChargebeeSubscription(value)) {
-    return (
-      (value.status === 'active' || value.status === 'non_renewing') &&
-      new Date(value.current_term_start).getTime() <= asOfDate.getTime() &&
-      asOfDate.getTime() <= new Date(value.current_term_end).getTime()
-    );
-  }
+function isStripePayment(
+  value: ChargebeeSubscription | StripePayment | LegacyInvoice,
+): value is StripePayment {
+  return 'payment_id' in value;
+}
 
-  if (value.status !== 'succeeded') return false;
-  const paymentDate = new Date(value.payment_date);
-  const activeUntil = new Date(paymentDate);
-  activeUntil.setUTCDate(activeUntil.getUTCDate() + 45);
-  return paymentDate.getTime() <= asOfDate.getTime() && asOfDate.getTime() <= activeUntil.getTime();
+function isLegacyInvoice(
+  value: ChargebeeSubscription | StripePayment | LegacyInvoice,
+): value is LegacyInvoice {
+  return 'payment_ref' in value && 'customer_name' in value;
+}
+
+function isChargebeeActiveAsOf(subscription: ChargebeeSubscription, asOfDate: Date): boolean {
+  return (
+    (subscription.status === 'active' || subscription.status === 'non_renewing') &&
+    new Date(subscription.current_term_start).getTime() <= asOfDate.getTime() &&
+    asOfDate.getTime() <= new Date(subscription.current_term_end).getTime()
+  );
 }
 
 function isOpportunityActiveAsOf(opportunity: SalesforceOpportunity, asOfDate: Date): boolean {
@@ -217,17 +361,49 @@ function getLastActivityDate(opportunity: SalesforceOpportunity): Date {
 
 function getAnalysisDate(
   opportunities: SalesforceOpportunity[],
-  subscriptions: (ChargebeeSubscription | StripePayment)[],
+  billingRecords: (ChargebeeSubscription | StripePayment | LegacyInvoice)[],
 ): Date {
   const timestamps = [
     ...opportunities.map((opp) => new Date(opp.close_date).getTime()),
-    ...subscriptions.map((item) =>
-      new Date(isChargebeeSubscription(item) ? item.current_term_start : item.payment_date).getTime(),
+    ...billingRecords.map((item) =>
+      new Date(
+        isChargebeeSubscription(item)
+          ? item.current_term_start
+          : isStripePayment(item)
+            ? item.payment_date
+            : item.date,
+      ).getTime(),
     ),
   ].filter(Number.isFinite);
+
   return new Date(Math.max(...timestamps, Date.now()));
+}
+
+function getMedianGapDays(dates: string[]): number {
+  const sorted = [...dates].sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
+  if (sorted.length < 2) return 30;
+
+  const gaps: number[] = [];
+  for (let index = 1; index < sorted.length; index += 1) {
+    const gap = diffDays(new Date(sorted[index - 1]!), new Date(sorted[index]!));
+    if (gap > 0) gaps.push(gap);
+  }
+
+  if (gaps.length === 0) return 30;
+  gaps.sort((a, b) => a - b);
+  return gaps[Math.floor(gaps.length / 2)] ?? 30;
+}
+
+function addDays(dateStr: string, days: number): string {
+  const date = new Date(dateStr);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString();
 }
 
 function diffDays(startDate: Date, endDate: Date): number {
   return Math.max(0, Math.round((endDate.getTime() - startDate.getTime()) / 86_400_000));
+}
+
+function roundMoney(value: number): number {
+  return Math.round(value * 100) / 100;
 }

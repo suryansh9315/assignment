@@ -16,20 +16,28 @@ type Row = Record<string, unknown> & {
   customerName: string;
   severity: string;
   type: string;
+  scope: string;
   systems: string;
+  sourceAValue: number | null;
+  sourceBValue: number | null;
+  percentDelta: number | null;
+  direction: string;
   amount: number;
-  exposureScope: 'Billing exposure' | 'Pipeline delta';
   description: string;
   resolved: boolean;
 };
 
-function isBillingExposure(item: Discrepancy): boolean {
-  return (
-    item.sourceA.system === 'chargebee' ||
-    item.sourceA.system === 'stripe' ||
-    item.sourceB.system === 'chargebee' ||
-    item.sourceB.system === 'stripe'
-  );
+function getScopeLabel(item: Discrepancy): string {
+  switch (item.scope) {
+    case 'billing_vs_crm':
+      return 'CRM mismatch';
+    case 'billing_vs_billing':
+      return 'Billing cross-check';
+    case 'duplicate_review':
+      return 'Duplicate review';
+    default:
+      return 'Review';
+  }
 }
 
 function toRows(discrepancies: Discrepancy[]): Row[] {
@@ -38,9 +46,13 @@ function toRows(discrepancies: Discrepancy[]): Row[] {
     customerName: item.customerName,
     severity: item.severity,
     type: item.type.replace(/_/g, ' '),
-    systems: `${item.sourceA.system} -> ${item.sourceB.system}`,
+    scope: getScopeLabel(item),
+    systems: `${item.sourceA.system} vs ${item.sourceB.system}`,
+    sourceAValue: typeof item.sourceA.value === 'number' ? item.sourceA.value : null,
+    sourceBValue: typeof item.sourceB.value === 'number' ? item.sourceB.value : null,
+    percentDelta: item.percentDelta ?? null,
+    direction: item.direction ?? 'Review needed',
     amount: item.amount ?? 0,
-    exposureScope: isBillingExposure(item) ? 'Billing exposure' : 'Pipeline delta',
     description: item.description,
     resolved: item.resolved,
   }));
@@ -62,9 +74,10 @@ export function DiscrepancyTable() {
   const totalImpact =
     run.data?.summary.totalAmountImpact ??
     discrepancies
-      .filter(isBillingExposure)
+      .filter((item) => item.scope === 'billing_vs_crm')
       .reduce((sum, item) => sum + Math.abs(item.amount ?? 0), 0);
-  const pipelineReviews = discrepancies.filter((item) => !isBillingExposure(item)).length;
+  const crmMismatches = discrepancies.filter((item) => item.scope === 'billing_vs_crm').length;
+  const billingCrossChecks = discrepancies.filter((item) => item.scope === 'billing_vs_billing').length;
 
   return (
     <div className="space-y-6 p-6">
@@ -72,10 +85,11 @@ export function DiscrepancyTable() {
         <p className="metric-label mb-2">Revenue Reconciliation</p>
         <h1 className="text-2xl font-semibold text-slate-100">Discrepancies</h1>
         <p className="mt-2 max-w-3xl text-sm text-slate-400">
-          Billing, CRM, and duplicate checks are rebuilt from source exports with every row tied
-          back to source systems and record IDs. Billing exposure is the current close-period
-          billing risk; pipeline deltas are CRM/bookings cleanup findings and are not included in
-          that exposure total.
+          Stripe, Chargebee, Meridian legacy, and Salesforce are rebuilt from source exports on
+          each run. The headline delta is a gross sum of billing-versus-CRM mismatches above 2%,
+          so it can exceed clean ARR when CRM amounts are overstated across many accounts. The
+          table keeps the system pair, mismatch direction, and side-by-side amounts visible for
+          review.
         </p>
       </div>
 
@@ -87,11 +101,12 @@ export function DiscrepancyTable() {
         />
         <Card title="High Risk" value={highRisk} icon={<RefreshCw size={18} />} />
         <Card
-          title="Billing Exposure"
+          title="Gross CRM Delta"
           value={currencyFormatter.format(totalImpact)}
           icon={<DollarSign size={18} />}
         />
-        <Card title="Pipeline Reviews" value={pipelineReviews} icon={<DollarSign size={18} />} />
+        <Card title="CRM Mismatches" value={crmMismatches} icon={<DollarSign size={18} />} />
+        <Card title="Billing Cross-Checks" value={billingCrossChecks} icon={<RefreshCw size={18} />} />
       </div>
 
       {run.error || list.error ? (
@@ -106,31 +121,50 @@ export function DiscrepancyTable() {
           columns={[
             { key: 'customerName', label: 'Customer', sortable: true },
             { key: 'severity', label: 'Severity', sortable: true },
-            { key: 'type', label: 'Type', sortable: true },
-            { key: 'systems', label: 'Systems' },
+            { key: 'scope', label: 'Scope', sortable: true },
+            {
+              key: 'systems',
+              label: 'Systems',
+              width: '10rem',
+              className: 'max-w-[10rem] whitespace-normal break-words text-xs text-slate-400',
+            },
+            {
+              key: 'sourceAValue',
+              label: 'Source A',
+              sortable: true,
+              render: (value) =>
+                value == null ? 'n/a' : currencyFormatter.format(Number(value ?? 0)),
+              className: 'text-right font-mono',
+            },
+            {
+              key: 'sourceBValue',
+              label: 'Source B',
+              sortable: true,
+              render: (value) =>
+                value == null ? 'n/a' : currencyFormatter.format(Number(value ?? 0)),
+              className: 'text-right font-mono',
+            },
+            {
+              key: 'percentDelta',
+              label: 'Delta %',
+              sortable: true,
+              render: (value) =>
+                value == null ? 'n/a' : `${Number(value).toFixed(2)}%`,
+              className: 'text-right font-mono',
+            },
+            { key: 'direction', label: 'Direction', sortable: true },
             {
               key: 'amount',
-              label: 'Row Delta',
+              label: 'Dollar Impact',
               sortable: true,
               render: (value) => currencyFormatter.format(Number(value ?? 0)),
               className: 'text-right font-mono',
             },
             {
-              key: 'exposureScope',
-              label: 'Exposure Scope',
-              sortable: true,
-              render: (value) =>
-                value === 'Billing exposure' ? (
-                  <span className="rounded-md border border-emerald-500/30 bg-emerald-950/30 px-2 py-1 text-xs text-emerald-200">
-                    Included
-                  </span>
-                ) : (
-                  <span className="rounded-md border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-300">
-                    Pipeline only
-                  </span>
-                ),
+              key: 'description',
+              label: 'Finding',
+              className: 'max-w-[18rem] whitespace-normal break-words',
             },
-            { key: 'description', label: 'Finding' },
             {
               key: 'resolved',
               label: 'Status',
