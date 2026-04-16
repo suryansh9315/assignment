@@ -1,4 +1,5 @@
 import type { CohortData, MetricOptions } from './types.js';
+import { getDefaultARRAsOfDate, getUnifiedARRRecords } from './arr.js';
 
 /**
  * Cohort retention analysis.
@@ -41,6 +42,94 @@ import type { CohortData, MetricOptions } from './types.js';
 export async function buildCohortAnalysis(
   options?: MetricOptions,
 ): Promise<CohortData[]> {
-  // TODO: Implement cohort analysis
-  throw new Error('Not implemented');
+  const endDate = options?.endDate ?? (await getDefaultARRAsOfDate());
+  const startDate = options?.startDate ?? new Date(Date.UTC(2024, 0, 31, 23, 59, 59));
+  const snapshots = new Map<string, Awaited<ReturnType<typeof getUnifiedARRRecords>>>();
+  let cursor = monthStart(startDate);
+  const final = monthStart(endDate);
+
+  while (cursor.getTime() <= final.getTime()) {
+    const month = formatMonth(cursor);
+    snapshots.set(month, await getUnifiedARRRecords(monthEnd(month), options));
+    cursor = addMonths(cursor, 1);
+  }
+
+  const firstSeen = new Map<string, { month: string; name: string; arr: number }>();
+  for (const [month, records] of snapshots.entries()) {
+    const customers = summarize(records);
+    for (const [customerKey, customer] of customers.entries()) {
+      if (!firstSeen.has(customerKey)) {
+        firstSeen.set(customerKey, { month, name: customer.name, arr: customer.arr });
+      }
+    }
+  }
+
+  const cohortMonths = [...new Set(Array.from(firstSeen.values()).map((item) => item.month))].sort();
+  return cohortMonths.map((cohortMonth) => {
+    const members = Array.from(firstSeen.entries()).filter(([, item]) => item.month === cohortMonth);
+    const startingRevenue = members.reduce((sum, [, item]) => sum + item.arr, 0);
+    const retention: number[] = [];
+    const customerRetention: number[] = [];
+
+    for (const month of snapshots.keys()) {
+      if (month < cohortMonth) continue;
+      const customers = summarize(snapshots.get(month)!);
+      const retainedRevenue = members.reduce(
+        (sum, [customerKey]) => sum + (customers.get(customerKey)?.arr ?? 0),
+        0,
+      );
+      const retainedCustomers = members.filter(([customerKey]) => (customers.get(customerKey)?.arr ?? 0) > 0).length;
+      retention.push(startingRevenue === 0 ? 0 : Number(((retainedRevenue / startingRevenue) * 100).toFixed(1)));
+      customerRetention.push(
+        members.length === 0 ? 0 : Number(((retainedCustomers / members.length) * 100).toFixed(1)),
+      );
+    }
+
+    const latestRevenue = retention.length === 0 ? 0 : (retention[retention.length - 1]! / 100) * startingRevenue;
+    const latestCustomers =
+      customerRetention.length === 0
+        ? 0
+        : Math.round((customerRetention[customerRetention.length - 1]! / 100) * members.length);
+
+    return {
+      cohortMonth,
+      customers: members.length,
+      revenue: Math.round(startingRevenue),
+      retention,
+      customerRetention,
+      avgRevenueAtSignup: members.length === 0 ? 0 : Math.round(startingRevenue / members.length),
+      avgRevenueLatest: latestCustomers === 0 ? 0 : Math.round(latestRevenue / latestCustomers),
+    };
+  });
+}
+
+function summarize(records: Awaited<ReturnType<typeof getUnifiedARRRecords>>) {
+  const summary = new Map<string, { name: string; arr: number }>();
+  for (const record of records) {
+    const current = summary.get(record.customerKey);
+    summary.set(record.customerKey, {
+      name: current?.name ?? record.companyName,
+      arr: (current?.arr ?? 0) + record.arr,
+    });
+  }
+  return summary;
+}
+
+function monthStart(date: Date): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
+}
+
+function monthEnd(month: string): Date {
+  const [year, monthNumber] = month.split('-').map(Number);
+  return new Date(Date.UTC(year!, monthNumber!, 0, 23, 59, 59));
+}
+
+function formatMonth(date: Date): string {
+  return date.toISOString().slice(0, 7);
+}
+
+function addMonths(date: Date, months: number): Date {
+  const next = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
+  next.setUTCMonth(next.getUTCMonth() + months);
+  return next;
 }

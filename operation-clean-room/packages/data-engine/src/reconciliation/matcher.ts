@@ -1,4 +1,5 @@
 import type { MatchResult, MatchConfidence } from './types.js';
+import { normalizeCompanyName } from '../utils/normalization.js';
 
 /**
  * Fuzzy matching engine for cross-system entity resolution.
@@ -54,8 +55,36 @@ export async function matchEntities(
   sourceB: Record<string, unknown>[],
   options?: MatchOptions,
 ): Promise<MatchResult[]> {
-  // TODO: Implement cross-system entity matching
-  throw new Error('Not implemented');
+  const threshold = options?.threshold ?? 0.6;
+  const allowMultipleMatches = options?.allowMultipleMatches ?? false;
+  const matches: MatchResult[] = [];
+  const claimedB = new Set<number>();
+
+  for (const entityA of sourceA) {
+    let best: { index: number; entity: Record<string, unknown>; confidence: MatchConfidence } | null =
+      null;
+
+    for (let index = 0; index < sourceB.length; index++) {
+      if (!allowMultipleMatches && claimedB.has(index)) continue;
+
+      const entityB = sourceB[index]!;
+      const confidence = await calculateConfidence(entityA, entityB);
+      if (confidence.score >= threshold && (best == null || confidence.score > best.confidence.score)) {
+        best = { index, entity: entityB, confidence };
+      }
+    }
+
+    if (best) {
+      claimedB.add(best.index);
+      matches.push({
+        entityA: { id: getEntityId(entityA), source: getEntitySource(entityA), ...entityA },
+        entityB: { id: getEntityId(best.entity), source: getEntitySource(best.entity), ...best.entity },
+        confidence: best.confidence,
+      });
+    }
+  }
+
+  return matches.sort((a, b) => b.confidence.score - a.confidence.score);
 }
 
 /**
@@ -69,6 +98,121 @@ export async function calculateConfidence(
   entityA: Record<string, unknown>,
   entityB: Record<string, unknown>,
 ): Promise<MatchConfidence> {
-  // TODO: Implement composite confidence scoring
-  throw new Error('Not implemented');
+  const matchedFields: string[] = [];
+  const unmatchedFields: string[] = [];
+  let score = 0;
+
+  const idA = getExternalId(entityA);
+  const idB = getExternalId(entityB);
+  if (idA && idB) {
+    if (idA === idB) {
+      matchedFields.push('external_id');
+      score += 1;
+    } else {
+      unmatchedFields.push('external_id');
+    }
+  }
+
+  const domainA = normalizeDomain(getString(entityA, ['domain', 'website', 'email']));
+  const domainB = normalizeDomain(getString(entityB, ['domain', 'website', 'email']));
+  if (domainA && domainB) {
+    if (domainA === domainB) {
+      matchedFields.push('domain');
+      score += 0.45;
+    } else {
+      unmatchedFields.push('domain');
+    }
+  }
+
+  const nameA = getString(entityA, ['name', 'company', 'companyName', 'customer_name', 'account_name']);
+  const nameB = getString(entityB, ['name', 'company', 'companyName', 'customer_name', 'account_name']);
+  const nameScore = computeNameSimilarity(nameA, nameB);
+  if (nameScore >= 0.95) {
+    matchedFields.push('company_name_exact');
+    score += 0.45;
+  } else if (nameScore >= 0.55) {
+    matchedFields.push('company_name_fuzzy');
+    score += 0.45 * nameScore;
+  } else {
+    unmatchedFields.push('company_name');
+  }
+
+  return {
+    score: Math.min(1, Number(score.toFixed(3))),
+    matchedFields,
+    unmatchedFields,
+  };
+}
+
+function getString(entity: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = entity[key];
+    if (typeof value === 'string' && value.trim().length > 0) return value.trim();
+  }
+  return '';
+}
+
+function getEntityId(entity: Record<string, unknown>): string {
+  return getString(entity, ['id', 'customer_id', 'account_id', 'subscription_id', 'payment_id']) || 'unknown';
+}
+
+function getEntitySource(entity: Record<string, unknown>): string {
+  return getString(entity, ['source', 'system']) || 'unknown';
+}
+
+function getExternalId(entity: Record<string, unknown>): string {
+  return getString(entity, [
+    'external_id',
+    'stripe_customer_id',
+    'chargebee_customer_id',
+    'customer_id',
+    'account_id',
+  ]);
+}
+
+function normalizeDomain(value: string): string {
+  if (!value) return '';
+  const emailDomain = value.includes('@') ? value.split('@').pop() ?? value : value;
+  return emailDomain
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .split('/')[0]!
+    .trim();
+}
+
+function computeNameSimilarity(nameA: string, nameB: string): number {
+  const normalizedA = normalizeCompanyName(nameA);
+  const normalizedB = normalizeCompanyName(nameB);
+  if (!normalizedA || !normalizedB) return 0;
+  if (normalizedA === normalizedB) return 1;
+  if (normalizedA.includes(normalizedB) || normalizedB.includes(normalizedA)) return 0.9;
+
+  const tokensA = new Set(normalizedA.split(' ').filter(Boolean));
+  const tokensB = new Set(normalizedB.split(' ').filter(Boolean));
+  const intersection = [...tokensA].filter((token) => tokensB.has(token)).length;
+  const union = new Set([...tokensA, ...tokensB]).size;
+  const jaccard = union === 0 ? 0 : intersection / union;
+  const edit = 1 - levenshtein(normalizedA, normalizedB) / Math.max(normalizedA.length, normalizedB.length);
+
+  return Math.max(jaccard, edit);
+}
+
+function levenshtein(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, index) => index);
+
+  for (let i = 1; i <= a.length; i++) {
+    let previous = i;
+    for (let j = 1; j <= b.length; j++) {
+      const temp = row[j]!;
+      row[j] =
+        a[i - 1] === b[j - 1]
+          ? row[j - 1]!
+          : Math.min(row[j - 1]!, previous, row[j]!) + 1;
+      previous = temp;
+    }
+    row[0] = i;
+  }
+
+  return row[b.length]!;
 }

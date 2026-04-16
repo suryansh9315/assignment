@@ -3,7 +3,8 @@ import type {
   ReconciliationResult,
   Discrepancy,
   PipelineQuality as PipelineQualityType,
-  ARRResponse,
+  ARRResult,
+  RevenueSummaryResult,
   NRRResponse,
   ChurnMetrics,
   UnitEconomics,
@@ -117,7 +118,7 @@ export function resolveDiscrepancy(
 
 export function getDuplicates(
   classification?: string,
-): Promise<ApiResponse<Discrepancy[]>> {
+): Promise<ApiResponse<unknown[]>> {
   const qs = classification ? buildQueryString({ classification }) : '';
   return request<ApiResponse<Discrepancy[]>>(`/reconciliation/duplicates${qs}`);
 }
@@ -132,9 +133,18 @@ export function getARR(options?: {
   date?: string;
   segmentBy?: string;
   excludeTrials?: boolean;
-}): Promise<ARRResponse> {
+}): Promise<ARRResult> {
   const qs = options ? buildQueryString(options) : '';
-  return request<ARRResponse>(`/metrics/arr${qs}`);
+  return request<ARRResult>(`/metrics/arr${qs}`);
+}
+
+export function getRevenueSummary(options?: {
+  startMonth?: string;
+  endMonth?: string;
+  excludeTrials?: boolean;
+}): Promise<RevenueSummaryResult> {
+  const qs = options ? buildQueryString(options) : '';
+  return request<RevenueSummaryResult>(`/metrics/revenue-summary${qs}`);
 }
 
 export function getNRR(options: {

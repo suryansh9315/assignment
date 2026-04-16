@@ -31,8 +31,48 @@
  * @returns Normalized name suitable for comparison
  */
 export function normalizeCompanyName(name: string): string {
-  // TODO: Implement company name normalization
-  throw new Error('Not implemented');
+  const legalSuffixes = [
+    'incorporated',
+    'inc',
+    'corporation',
+    'corp',
+    'company',
+    'co',
+    'limited',
+    'ltd',
+    'llc',
+    'gmbh',
+    'ag',
+    'sa',
+    'sas',
+    'bv',
+    'nv',
+    'pty',
+    'group',
+    'holdings',
+    'holding',
+    'systems',
+    'solutions',
+    'technologies',
+    'technology',
+    'software',
+    'services',
+    'service',
+    'studios',
+    'studio',
+    'corporation',
+  ];
+
+  const suffixPattern = new RegExp(`\\b(?:${legalSuffixes.join('|')})\\b`, 'g');
+
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/^the\s+/, '')
+    .replace(/[.,'’&/()-]/g, ' ')
+    .replace(suffixPattern, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /**
@@ -54,6 +94,16 @@ export function normalizeCompanyName(name: string): string {
  * @returns Amount normalized to major currency units (e.g., dollars, not cents)
  */
 export function normalizeAmount(amount: number, currency: string): number {
-  // TODO: Implement amount normalization
-  throw new Error('Not implemented');
+  const zeroDecimalCurrencies = new Set(['JPY', 'KRW', 'VND']);
+  const normalizedCurrency = currency.trim().toUpperCase();
+
+  if (zeroDecimalCurrencies.has(normalizedCurrency)) {
+    return amount;
+  }
+
+  if (Number.isInteger(amount) && Math.abs(amount) > 10_000) {
+    return amount / 100;
+  }
+
+  return amount;
 }

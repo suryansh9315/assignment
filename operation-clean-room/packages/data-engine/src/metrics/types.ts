@@ -60,6 +60,39 @@ export interface ARRResult {
   medianARRPerCustomer: number;
 }
 
+/** Monthly ARR movement and run-rate revenue point for the CFO revenue view. */
+export interface MonthlyRevenueSummary {
+  month: string;
+  arr: number;
+  mrrRunRate: number;
+  newBusiness: number;
+  expansion: number;
+  contraction: number;
+  churn: number;
+  customerCount: number;
+  byPlan: ARRBreakdown[];
+}
+
+/** Timing issue surfaced for board/audit review rather than full revenue recognition. */
+export interface RevenueTimingIssue {
+  id: string;
+  source: 'chargebee' | 'stripe' | 'legacy';
+  customerName: string;
+  description: string;
+  amount: number;
+  date: string;
+  severity: 'medium' | 'high';
+}
+
+/** CFO-facing ARR and revenue summary payload. */
+export interface RevenueSummaryResult {
+  asOfDate: string;
+  currentARR: ARRResult;
+  monthly: MonthlyRevenueSummary[];
+  planMix: ARRBreakdown[];
+  timingIssues: RevenueTimingIssue[];
+}
+
 // ---------------------------------------------------------------------------
 // NRR (Net Revenue Retention)
 // ---------------------------------------------------------------------------

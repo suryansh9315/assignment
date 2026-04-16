@@ -16,6 +16,10 @@ export interface HealthResponse {
 // ── Revenue & ARR ────────────────────────────────────────────────────────────
 
 export interface ARRBreakdown {
+  label?: string;
+  arr?: number;
+  customerCount?: number;
+  percentOfTotal?: number;
   total: number;
   newBusiness: number;
   expansion: number;
@@ -23,10 +27,53 @@ export interface ARRBreakdown {
   churn: number;
 }
 
-export interface ARRResponse {
+export interface ARRSegmentBreakdown {
+  label: string;
+  arr: number;
+  customerCount: number;
+  percentOfTotal: number;
+}
+
+export interface ARRResult {
+  total: number;
+  bySegment: ARRSegmentBreakdown[];
+  byPlan: ARRSegmentBreakdown[];
+  byRegion: ARRSegmentBreakdown[];
+  byCohort: ARRSegmentBreakdown[];
+  asOfDate: string;
+  totalCustomers: number;
+  avgARRPerCustomer: number;
+  medianARRPerCustomer: number;
+}
+
+export interface MonthlyRevenueSummary {
+  month: string;
+  arr: number;
+  mrrRunRate: number;
+  newBusiness: number;
+  expansion: number;
+  contraction: number;
+  churn: number;
+  customerCount: number;
+  byPlan: ARRSegmentBreakdown[];
+}
+
+export interface RevenueTimingIssue {
+  id: string;
+  source: 'chargebee' | 'stripe' | 'legacy';
+  customerName: string;
+  description: string;
+  amount: number;
   date: string;
-  arr: ARRBreakdown;
-  segments?: Record<string, ARRBreakdown>;
+  severity: 'medium' | 'high';
+}
+
+export interface RevenueSummaryResult {
+  asOfDate: string;
+  currentARR: ARRResult;
+  monthly: MonthlyRevenueSummary[];
+  planMix: ARRSegmentBreakdown[];
+  timingIssues: RevenueTimingIssue[];
 }
 
 export interface RevenueOverview {
@@ -45,27 +92,31 @@ export interface RevenueOverview {
 // ── Churn ────────────────────────────────────────────────────────────────────
 
 export interface ChurnMetrics {
-  grossChurnRate: number;
-  netChurnRate: number;
+  grossChurn: number;
+  netChurn: number;
   logoChurnRate: number;
-  revenueChurnRate: number;
-  churned: number;
-  period: { start: string; end: string };
+  logoChurnCount: number;
+  revenueChurned: number;
+  byReason?: unknown[];
+  bySegment?: unknown[];
+  byPlan?: unknown[];
+  byTenure?: unknown[];
+  periodStart: string;
+  periodEnd: string;
 }
 
 // ── NRR ──────────────────────────────────────────────────────────────────────
 
 export interface NRRResponse {
-  nrr: number;
-  period: { start: string; end: string };
-  components: {
-    startingRevenue: number;
-    expansion: number;
-    contraction: number;
-    churn: number;
-    endingRevenue: number;
-  };
-  segments?: Record<string, number>;
+  percentage: number;
+  expansion: number;
+  contraction: number;
+  churn: number;
+  startingARR: number;
+  endingARR: number;
+  breakdown: unknown[];
+  periodStart: string;
+  periodEnd: string;
 }
 
 // ── Unit Economics ────────────────────────────────────────────────────────────
@@ -75,60 +126,86 @@ export interface UnitEconomics {
   ltv: number;
   ltvCacRatio: number;
   paybackMonths: number;
+  grossMargin?: number;
+  arpa?: number;
+  byChannel?: {
+    channel: string;
+    cac: number;
+    ltv: number;
+    ltvCacRatio: number;
+    paybackMonths: number;
+    customersAcquired: number;
+    totalSpend: number;
+  }[];
   period: string;
 }
 
 // ── Cohorts ──────────────────────────────────────────────────────────────────
 
 export interface CohortRow {
-  cohort: string;
-  size: number;
+  cohort?: string;
+  cohortMonth?: string;
+  size?: number;
+  customers?: number;
   retention: number[];
-  revenue: number[];
+  revenue: number[] | number;
+  customerRetention?: number[];
+  avgRevenueAtSignup?: number;
+  avgRevenueLatest?: number;
 }
 
-export interface CohortResponse {
-  cohorts: CohortRow[];
-  granularity: 'monthly' | 'quarterly';
-}
+export type CohortResponse = CohortRow[];
 
 // ── Reconciliation & Discrepancies ───────────────────────────────────────────
 
 export type DiscrepancySeverity = 'critical' | 'high' | 'medium' | 'low';
 export type DiscrepancyType =
   | 'amount_mismatch'
-  | 'missing_record'
+  | 'missing_account'
   | 'date_mismatch'
   | 'status_mismatch'
-  | 'duplicate'
-  | 'classification_error';
+  | 'duplicate_account'
+  | 'orphan_record'
+  | 'fx_discrepancy';
 export type DiscrepancyStatus = 'open' | 'investigating' | 'resolved' | 'dismissed';
 
 export interface Discrepancy {
   id: string;
   type: DiscrepancyType;
   severity: DiscrepancySeverity;
-  status: DiscrepancyStatus;
+  sourceA: {
+    system: string;
+    recordId: string;
+    value: string | number | null;
+  };
+  sourceB: {
+    system: string;
+    recordId: string;
+    value: string | number | null;
+  };
+  customerName: string;
+  amount: number | null;
   description: string;
-  systemA: string;
-  systemB: string;
-  valueA: string | number;
-  valueB: string | number;
-  delta: number;
-  customerId?: string;
   detectedAt: string;
-  resolvedAt?: string;
-  resolutionNote?: string;
+  resolved: boolean;
+  resolutionNote: string | null;
 }
 
 export interface ReconciliationResult {
-  runId: string;
-  timestamp: string;
-  totalRecords: number;
-  matched: number;
-  discrepancies: number;
-  bySeverity: Record<DiscrepancySeverity, number>;
-  byType: Record<DiscrepancyType, number>;
+  discrepancies: Discrepancy[];
+  summary: {
+    totalDiscrepancies: number;
+    bySeverity: Record<DiscrepancySeverity, number>;
+    byType: Record<DiscrepancyType, number>;
+    totalAmountImpact: number;
+    recordsProcessed: Record<string, number>;
+  };
+  metadata: {
+    startedAt: string;
+    completedAt: string;
+    durationMs: number;
+    options: Record<string, unknown>;
+  };
 }
 
 // ── Pipeline ─────────────────────────────────────────────────────────────────
@@ -146,13 +223,33 @@ export interface PipelineDeal {
 }
 
 export interface PipelineQuality {
-  totalDeals: number;
-  totalValue: number;
-  weightedValue: number;
-  zombieDeals: number;
-  zombieValue: number;
-  stageDistribution: Record<string, { count: number; value: number }>;
-  avgDaysInStage: Record<string, number>;
+  zombieDeals: {
+    opportunityId: string;
+    accountName: string;
+    amount: number;
+    stage: string;
+    daysSinceActivity: number;
+  }[];
+  mismatches: {
+    opportunityId: string;
+    accountName: string;
+    issue: string;
+    crmValue: string | number;
+    billingValue: string | number;
+  }[];
+  unbookedRevenue: {
+    subscriptionId: string;
+    customerName: string;
+    mrr: number;
+    system: string;
+  }[];
+  summary: {
+    totalZombieDeals: number;
+    totalZombieValue: number;
+    totalMismatches: number;
+    totalUnbookedMRR: number;
+    pipelineHealthScore: number;
+  };
 }
 
 // ── Customer Health ──────────────────────────────────────────────────────────

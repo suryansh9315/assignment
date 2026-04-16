@@ -1,4 +1,87 @@
-import { FXRate } from '../ingestion/types.js';
+import { loadCSV } from '../ingestion/csv-loader.js';
+import type { FXRate } from '../ingestion/types.js';
+
+function normalizeDateKey(value: Date): string {
+  return value.toISOString().slice(0, 10);
+}
+
+function normalizeCurrency(currency: string): string {
+  return currency.trim().toUpperCase();
+}
+
+function parseFXRateRow(row: Record<string, string>): FXRate {
+  const date = row.date?.trim();
+  if (!date) {
+    throw new Error('Missing FX rate date');
+  }
+
+  const parseRate = (value: string | undefined, fieldName: string): number => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`Invalid FX rate field "${fieldName}"`);
+    }
+
+    return parsed;
+  };
+
+  return {
+    date,
+    eur_usd: parseRate(row.eur_usd, 'eur_usd'),
+    gbp_usd: parseRate(row.gbp_usd, 'gbp_usd'),
+    jpy_usd: parseRate(row.jpy_usd, 'jpy_usd'),
+    aud_usd: parseRate(row.aud_usd, 'aud_usd'),
+  };
+}
+
+function getRateField(currency: string): keyof Omit<FXRate, 'date'> | null {
+  switch (normalizeCurrency(currency)) {
+    case 'USD':
+      return null;
+    case 'EUR':
+      return 'eur_usd';
+    case 'GBP':
+      return 'gbp_usd';
+    case 'JPY':
+      return 'jpy_usd';
+    case 'AUD':
+      return 'aud_usd';
+    default:
+      throw new Error(`Unsupported currency "${currency}"`);
+  }
+}
+
+export async function loadFXRates(filePath: string): Promise<FXRate[]> {
+  return loadCSV<FXRate>(filePath, {
+    transform: (row) => parseFXRateRow(row),
+  });
+}
+
+export function findHistoricalFXRate(
+  currency: string,
+  date: Date,
+  rates: FXRate[],
+): number {
+  const rateField = getRateField(currency);
+  if (rateField == null) {
+    return 1;
+  }
+
+  const rateByDate = new Map(rates.map((rate) => [rate.date, rate]));
+
+  for (let lookbackDays = 0; lookbackDays <= 5; lookbackDays++) {
+    const lookupDate = new Date(date);
+    lookupDate.setUTCDate(lookupDate.getUTCDate() - lookbackDays);
+
+    const rate = rateByDate.get(normalizeDateKey(lookupDate));
+    if (rate) {
+      return rate[rateField];
+    }
+  }
+
+  throw new Error(
+    `No FX rate found for ${normalizeCurrency(currency)} on ${normalizeDateKey(date)} or prior 5 days`,
+  );
+}
 
 /**
  * Convert an amount from one currency to USD using historical FX rates.
@@ -28,6 +111,6 @@ export function convertToUSD(
   date: Date,
   rates: FXRate[],
 ): number {
-  // TODO: Implement - handle missing dates (weekends/holidays), currency lookup
-  throw new Error('Not implemented');
+  const fxRate = findHistoricalFXRate(currency, date, rates);
+  return Math.round(amount * fxRate * 100) / 100;
 }

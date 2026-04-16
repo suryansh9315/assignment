@@ -1,4 +1,5 @@
 import type { NRRResult, MetricOptions } from './types.js';
+import { getUnifiedARRRecords } from './arr.js';
 
 /**
  * Net Revenue Retention (NRR) calculation.
@@ -41,6 +42,68 @@ export async function calculateNRR(
   endDate: Date,
   options?: MetricOptions,
 ): Promise<NRRResult> {
-  // TODO: Implement NRR calculation
-  throw new Error('Not implemented');
+  const [startRecords, endRecords] = await Promise.all([
+    getUnifiedARRRecords(startDate, options),
+    getUnifiedARRRecords(endDate, options),
+  ]);
+  const start = summarize(startRecords);
+  const end = summarize(endRecords);
+  let expansion = 0;
+  let contraction = 0;
+  let churn = 0;
+  const breakdown: NRRResult['breakdown'] = [];
+
+  for (const [customerKey, starting] of start.entries()) {
+    const ending = end.get(customerKey);
+    const endingARR = ending?.arr ?? 0;
+    const change = endingARR - starting.arr;
+    let changeType: NRRResult['breakdown'][number]['changeType'] = 'unchanged';
+
+    if (endingARR === 0) {
+      churn += starting.arr;
+      changeType = 'churn';
+    } else if (change > 0) {
+      expansion += change;
+      changeType = 'expansion';
+    } else if (change < 0) {
+      contraction += Math.abs(change);
+      changeType = 'contraction';
+    }
+
+    breakdown.push({
+      customerName: ending?.name ?? starting.name,
+      startingARR: starting.arr,
+      endingARR,
+      change,
+      changeType,
+      reason: changeType === 'unchanged' ? null : `${changeType} between period snapshots`,
+    });
+  }
+
+  const startingARR = Array.from(start.values()).reduce((sum, record) => sum + record.arr, 0);
+  const endingARR = startingARR + expansion - contraction - churn;
+
+  return {
+    percentage: startingARR === 0 ? 0 : Number(((endingARR / startingARR) * 100).toFixed(2)),
+    expansion: Math.round(expansion),
+    contraction: Math.round(contraction),
+    churn: Math.round(churn),
+    startingARR: Math.round(startingARR),
+    endingARR: Math.round(endingARR),
+    breakdown: breakdown.sort((a, b) => Math.abs(b.change) - Math.abs(a.change)),
+    periodStart: startDate.toISOString(),
+    periodEnd: endDate.toISOString(),
+  };
+}
+
+function summarize(records: Awaited<ReturnType<typeof getUnifiedARRRecords>>) {
+  const summary = new Map<string, { name: string; arr: number }>();
+  for (const record of records) {
+    const current = summary.get(record.customerKey);
+    summary.set(record.customerKey, {
+      name: current?.name ?? record.companyName,
+      arr: (current?.arr ?? 0) + record.arr,
+    });
+  }
+  return summary;
 }
