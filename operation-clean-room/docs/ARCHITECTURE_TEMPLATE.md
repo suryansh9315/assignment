@@ -75,6 +75,8 @@ The scorer computes five weighted signals:
 - NPS
 - Engagement
 
+For ARR context, the scorer now reuses billing-backed unified ARR records at the latest billing snapshot date instead of falling back to Salesforce `annual_revenue`. That keeps customer-health ARR exposure aligned with the board-facing revenue logic, while allowing unmapped CRM-only accounts to remain scoreable with `0` ARR.
+
 The route maps the composite score into dashboard grades (`A`-`F`) and derives a churn-risk ranking. By default, the metrics route returns the full scored portfolio unless the caller supplies pagination or filters. The dashboard then highlights the highest-risk accounts from that full set.
 
 ### Reconciliation
@@ -223,6 +225,7 @@ See [ASSUMPTIONS_TEMPLATE.md](./ASSUMPTIONS_TEMPLATE.md).
 - Reconciliation runs and discrepancy resolutions are stored only in process memory.
 - Scenario modeling is scaffolded but not implemented.
 - Customer-health scoring is directionally useful, but some signals are still weakly calibrated for this sample dataset.
+- Customer-health ARR can still understate total clean ARR when active billing records do not map cleanly back to Salesforce accounts, because the health portfolio only shows billing-backed ARR for resolved account matches.
 
 ## Future Extensibility
 

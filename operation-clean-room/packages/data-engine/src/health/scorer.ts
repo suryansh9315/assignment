@@ -6,6 +6,7 @@ import { loadChargebeeSubscriptions } from '../ingestion/chargebee.js';
 import { loadSalesforceData } from '../ingestion/salesforce.js';
 import { loadStripePayments } from '../ingestion/stripe.js';
 import type { ChargebeeSubscription, ProductEvent } from '../ingestion/types.js';
+import { getDefaultARRAsOfDate, getUnifiedARRRecords, type UnifiedARRRecord } from '../metrics/arr.js';
 import { normalizeCompanyName } from '../utils/normalization.js';
 import { RiskLevel, type HealthScore, type HealthScoringOptions, type HealthSignal } from './types.js';
 
@@ -63,7 +64,15 @@ export async function calculateHealthScores(
   options?: HealthScoringOptions,
 ): Promise<HealthScore[]> {
   const dataDir = getDataDir();
-  const [subscriptions, stripePayments, [, accounts], supportTickets, npsResponses, productEvents] =
+  const [
+    subscriptions,
+    stripePayments,
+    [, accounts],
+    supportTickets,
+    npsResponses,
+    productEvents,
+    billingAsOfDate,
+  ] =
     await Promise.all([
       loadChargebeeSubscriptions(dataDir),
       loadStripePayments(dataDir),
@@ -71,7 +80,14 @@ export async function calculateHealthScores(
       loadSupportTickets(dataDir),
       loadNpsResponses(dataDir),
       loadJSONL<ProductEvent>(join(dataDir, 'product_events.jsonl')),
+      getDefaultARRAsOfDate(),
     ]);
+  const billingArrByAccount = buildBillingArrIndex(
+    await getUnifiedARRRecords(billingAsOfDate, {
+      excludeTrials: true,
+      excludeChurned: true,
+    }),
+  );
 
   const referenceDates = getDatasetReferenceDates({
     subscriptions,
@@ -107,7 +123,8 @@ export async function calculateHealthScores(
 
   for (const account of accounts) {
     const subscription = subscriptionsByAccount.get(account.account_id) ?? null;
-    const currentMrr = subscription?.mrr ?? Math.max(0, account.annual_revenue / 12);
+    const billingContext = billingArrByAccount.get(account.account_id) ?? null;
+    const currentMrr = billingContext ? round2(billingContext.arr / 12) : 0;
     if (currentMrr < (options?.minMRR ?? 0)) continue;
     if (options?.segments?.length && !options.segments.includes(account.segment)) continue;
 
@@ -152,8 +169,8 @@ export async function calculateHealthScores(
       signals,
       riskLevel,
       lastUpdated: asOfDate.toISOString(),
-      mrr: round2(currentMrr),
-      plan: subscription?.plan.plan_name ?? 'Unmapped',
+      mrr: currentMrr,
+      plan: subscription?.plan.plan_name ?? billingContext?.planName ?? 'Unmapped',
       segment: account.segment,
       daysUntilRenewal: subscription
         ? getDaysUntil(new Date(subscription.current_term_end), referenceDates.billing)
@@ -169,6 +186,11 @@ export async function calculateHealthScores(
 }
 
 type WeightConfig = Required<NonNullable<HealthScoringOptions['weights']>>;
+
+type BillingArrContext = {
+  arr: number;
+  planName: string;
+};
 
 type RawSupportTicket = {
   ticket_id: string;
@@ -377,6 +399,31 @@ function buildSubscriptionIndex(
       index.set(accountId, subscription);
     }
   }
+  return index;
+}
+
+function buildBillingArrIndex(records: UnifiedARRRecord[]): Map<string, BillingArrContext> {
+  const index = new Map<string, BillingArrContext>();
+
+  for (const record of records) {
+    const accountId = record.account?.account_id;
+    if (!accountId) continue;
+
+    const existing = index.get(accountId);
+    if (!existing) {
+      index.set(accountId, {
+        arr: record.arr,
+        planName: record.planName,
+      });
+      continue;
+    }
+
+    existing.arr = round2(existing.arr + record.arr);
+    if (existing.planName === 'Unknown' && record.planName !== 'Unknown') {
+      existing.planName = record.planName;
+    }
+  }
+
   return index;
 }
 
